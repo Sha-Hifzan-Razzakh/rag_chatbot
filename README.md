@@ -66,31 +66,31 @@ rag-chatbot/
 ├── .env.example
 ├── .gitignore
 └── README.md
-⚙️ Tech Stack
-Backend
 
-Python 3.12
 
-FastAPI
+## ⚙️ Tech Stack
 
-LangChain + langchain-openai
+### Backend
 
-PostgreSQL + pgvector (via langchain-postgres)
+- Python 3.12
+- FastAPI
+- LangChain + `langchain-openai`
+- PostgreSQL + pgvector (via `langchain-postgres`)
+- Pydantic v2 / `pydantic-settings`
+- Uvicorn
 
-Pydantic v2 / pydantic-settings
+### Frontend
 
-Uvicorn
+- Streamlit
+- `requests` (to call the backend)
 
-Frontend
+---
 
-Streamlit
+## 🚀 Getting Started (Local Dev)
 
-Requests (to call the backend)
+### 1. Clone and set up env
 
-🚀 Getting Started (Local Dev)
-1. Clone and set up env
-bash
-Copy code
+```bash
 git clone <your-repo-url>
 cd rag-chatbot
 
@@ -199,8 +199,7 @@ Copy code
   "intent": "RAG_QA"
 }
 Ingest
-POST /v1/ingest/text
-Ingests raw text.
+POST /v1/ingest/text — ingests raw text.
 
 jsonc
 Copy code
@@ -209,8 +208,7 @@ Copy code
   "namespace": "kb-1",
   "metadata": { "source": "manual" }
 }
-POST /v1/ingest/file
-Basic support for .txt/.md (can be extended for PDFs, etc.).
+POST /v1/ingest/file — basic support for .txt / .md (can be extended for PDFs, etc.).
 
 🧠 RAG Features
 Intent classification (intent.py):

@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+from app.audio.types import TTSResponseFormat
 
 
 # --- Shared types ---
@@ -58,6 +59,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional namespace / knowledge base identifier for multi-tenant setups.",
     )
+    return_audio: bool = Field(
+        default=False,
+        description="If true, the backend will also generate TTS audio for the assistant's answer and return it (typically as base64) in the chat response.",
+    )
 
 
 class Source(BaseModel):
@@ -104,6 +109,7 @@ class ChatResponse(BaseModel):
         ...,
         description='Detected query intent, e.g. "RAG_QA", "CHITCHAT", or "OTHER".',
     )
+    answer_audio_b64: str | None = None
 
 
 # --- Ingestion endpoint models ---
@@ -146,3 +152,12 @@ class IngestResponse(BaseModel):
         ...,
         description="Total number of chunks stored in the vector DB.",
     )
+
+class STTResponse(BaseModel):
+    text: str
+    language: Optional[str] = None
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    format: Optional[TTSResponseFormat] = None

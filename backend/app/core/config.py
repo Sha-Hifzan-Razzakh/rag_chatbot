@@ -1,7 +1,7 @@
 from typing import Any, List, Optional
 from pathlib import Path
-
-from pydantic import SecretStr, field_validator
+from app.audio.types import TTSResponseFormat
+from pydantic import SecretStr, field_validator,Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,10 +36,22 @@ class Settings(BaseSettings):
     PGVECTOR_SCHEMA: Optional[str] = None
     PGVECTOR_COLLECTION: str = "documents"
 
+
     # --- RAG / retrieval defaults ---
     DEFAULT_TOP_K: int = 5
     MAX_TOP_K: int = 20
     DEFAULT_TEMPERATURE: float = 0.2
+
+    ENABLE_TTS: bool = Field(default=True)
+    ENABLE_STT: bool = Field(default=True)
+
+    # Model names (adjust to what you actually use)
+    TTS_MODEL_NAME: str = Field(default="gpt-4o-mini-tts")      # or "tts-1"
+    STT_MODEL_NAME: str = Field(default="gpt-4o-mini-transcribe")  # or "whisper-1"
+
+    # TTS defaults
+    TTS_VOICE: str = Field(default="alloy")
+    TTS_FORMAT: TTSResponseFormat = Field(default="mp3")
 
     # --- CORS ---
     CORS_ALLOW_ORIGINS: List[str] = [

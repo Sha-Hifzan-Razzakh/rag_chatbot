@@ -6,6 +6,8 @@ from app.core.config import settings
 from app.models.schemas import ChatRequest, ChatResponse, IntentLiteral
 from app.rag.intent import classify_intent
 from app.rag.pipeline import run_rag_pipeline, run_chitchat_pipeline
+from app.audio.tts import synthesize_speech
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,27 @@ async def chat_endpoint(payload: ChatRequest) -> ChatResponse:
 
         # Ensure intent field is populated in the response
         response.intent = intent
+        logger.info(
+                "TTS flags: return_audio=%s ENABLE_TTS=%s",
+                payload.return_audio,
+                settings.ENABLE_TTS,
+            )
+        # If TTS requested, generate audio and attach as base64
+        if payload.return_audio and settings.ENABLE_TTS:
+            try:
+                audio_bytes = synthesize_speech(
+                    text=response.answer,
+                    voice=settings.TTS_VOICE,
+                    format=settings.TTS_FORMAT,
+                )
+
+                response.answer_audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            except Exception as tts_exc:  # noqa: BLE001
+                logger.exception("TTS failed (continuing without audio): %s", tts_exc)
+                response.answer_audio_b64 = None
+                logger.info("return_audio=%r (%s)", payload.return_audio, type(payload.return_audio))
+
+
         return response
 
     except HTTPException:

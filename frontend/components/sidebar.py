@@ -3,13 +3,11 @@ from typing import Any, Dict, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-
-load_dotenv()
-
-DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+from .stt import stt_widget
 
 
-def render_sidebar() -> Dict[str, Any]:
+
+def render_sidebar(backend_url: str) -> Dict[str, Any]:
     """
     Render the sidebar controls and return the current configuration.
 
@@ -28,7 +26,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("#### Backend")
         st.text_input(
             "Backend URL",
-            value=DEFAULT_BACKEND_URL,
+            value=backend_url,
             disabled=True,
             help="Configure via BACKEND_URL env var.",
             key="backend_url_display",
@@ -63,6 +61,11 @@ def render_sidebar() -> Dict[str, Any]:
         )
         namespace: Optional[str] = namespace_input or None
 
+        tts_enabled = st.checkbox("🔊 Read answers aloud (TTS)", key="use_tts", value=False)
+        st.divider()
+
+        stt_widget(backend_url=backend_url)
+
         st.markdown("---")
         st.markdown("#### Ingest text")
         ingest_text = st.text_area(
@@ -92,4 +95,6 @@ def render_sidebar() -> Dict[str, Any]:
         "namespace": namespace,
         "ingest_text": ingest_text,
         "ingest_button_clicked": ingest_button_clicked,
+        "use_tts": st.session_state.get("use_tts", False),
     }
+

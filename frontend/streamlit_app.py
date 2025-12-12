@@ -1,8 +1,10 @@
 import os
 from typing import Any, Dict, List, Optional
-
+import base64
 import requests
 import streamlit as st
+from components.sidebar import render_sidebar
+
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -73,7 +75,7 @@ except Exception:  # noqa: BLE001
 try:
     from components.sidebar import render_sidebar  # type: ignore
 except Exception:  # noqa: BLE001
-    def render_sidebar() -> Dict[str, Any]:
+    def render_sidebar(backend_url: str) -> Dict[str, Any]:
         """
         Fallback sidebar renderer if components.sidebar is not implemented yet.
 
@@ -192,6 +194,7 @@ def call_chat(
     style: str,
     top_k: int,
     namespace: Optional[str],
+    return_audio: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Call the backend /v1/chat endpoint.
@@ -212,6 +215,7 @@ def call_chat(
         "style": style,
         "top_k": top_k,
         "namespace": namespace,
+        "return_audio": return_audio,
     }
 
     try:
@@ -223,6 +227,13 @@ def call_chat(
     except Exception as exc:  # noqa: BLE001
         st.error(f"Chat error: {exc}")
     return None
+
+def stt_transcribe(backend_url: str, audio_bytes: bytes, filename="audio.wav", language=None):
+    files = {"file": (filename, audio_bytes, "audio/wav")}
+    params = {"language": language} if language else {}
+    r = requests.post(f"{backend_url}/v1/audio/stt", files=files, params=params, timeout=120)
+    r.raise_for_status()
+    return r.json()["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +268,24 @@ def main() -> None:
             st.write(f"Environment: `{health.get('environment', 'unknown')}`")
 
     # Sidebar settings & ingestion
-    sidebar_state = render_sidebar()
+    sidebar_state = render_sidebar(backend_url=BACKEND_URL)
     tone = sidebar_state["tone"]
     style = sidebar_state["style"]
     top_k = sidebar_state["top_k"]
     namespace = sidebar_state["namespace"]
+    sidebar_state.setdefault("tts_enabled", sidebar_state.get("use_tts", False))
+    tts_enabled = bool(sidebar_state["tts_enabled"])
+    tts_mode = sidebar_state.get("tts_mode", "inline_base64")
+
+    return_audio = bool(tts_enabled and tts_mode == "inline_base64")
+
+    st.subheader("Speech to Text")
+    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "webm"])
+
+    if st.button("Transcribe") and audio_file is not None:
+        text = stt_transcribe(BACKEND_URL, audio_file.read(), filename=audio_file.name)
+        st.write(text)
+
 
     if sidebar_state["ingest_button_clicked"] and sidebar_state["ingest_text"].strip():
         with st.spinner("Ingesting text into vector store..."):
@@ -315,6 +339,7 @@ def main() -> None:
                     style=style,
                     top_k=top_k,
                     namespace=namespace,
+                    return_audio=return_audio,
                 )
 
             if response is None:
@@ -328,6 +353,32 @@ def main() -> None:
 
             # Show answer in the live assistant bubble
             st.markdown(answer)
+
+            #  PLACE: capture/store base64 (inline mode only)
+            answer_audio_b64 = None
+            if tts_enabled and tts_mode == "inline_base64":
+                answer_audio_b64 = response  # Store the base64 audio data
+
+            # PLACE: playback (both modes)
+
+            if tts_enabled:
+                if tts_mode == "inline_base64":
+                    audio_b64 = response.get("answer_audio_b64")
+                    if audio_b64:
+                        st.audio(base64.b64decode(audio_b64), format="audio/mp3")
+                    else:
+                        st.warning("TTS audio was requested but not returned.")
+                else:
+                    tts_resp = requests.post(
+                        f"{BACKEND_URL}/v1/audio/tts",
+                        json={"text": answer, "format": "mp3"},
+                        timeout=60,
+                    )
+                    if tts_resp.status_code == 200:
+                        st.audio(tts_resp.content, format="audio/mp3")
+                    else:
+                        st.warning(f"TTS failed: {tts_resp.status_code} - {tts_resp.text}")
+
 
             if sources:
                 with st.expander("Sources", expanded=False):
@@ -358,6 +409,7 @@ def main() -> None:
                     "intent": intent,
                     "sources": sources,
                     "suggested_questions": suggested,
+                    "answer_audio_b64": answer_audio_b64,
                 }
             )
 

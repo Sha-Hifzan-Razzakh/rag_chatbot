@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.api.v1 import chat, ingest, health
+from app.api.v1 import audio
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router, prefix="/v1", tags=["health"])
     app.include_router(chat.router, prefix="/v1", tags=["chat"])
     app.include_router(ingest.router, prefix="/v1", tags=["ingest"])
+    app.include_router(audio.router, prefix="/v1", tags=["audio"])
 
     return app
 

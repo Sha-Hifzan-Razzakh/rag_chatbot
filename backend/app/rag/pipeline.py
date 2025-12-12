@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import logging
+from typing import List, Optional
+
+from langchain_openai import ChatOpenAI
+
+from app.core.config import settings
+from app.core.prompts import (
+    ANSWER_PROMPT,
+    CONDENSE_QUESTION_PROMPT,
+    SELF_CHECK_PROMPT,
+)
+from app.models.schemas import ChatResponse, Message, Source
+from app.rag.retriever import docs_to_context, retrieve_docs
+from app.rag.suggestions import generate_suggested_questions
+
+logger = logging.getLogger(__name__)
+
+_answer_llm: Optional[ChatOpenAI] = None
+_rewrite_llm: Optional[ChatOpenAI] = None
+_self_check_llm: Optional[ChatOpenAI] = None
+_chitchat_llm: Optional[ChatOpenAI] = None
+
+
+CHITCHAT_SYSTEM_PROMPT = """
+You are a friendly, concise AI assistant.
+
+You can:
+- Greet the user.
+- Answer casual questions.
+- Engage in light small talk.
+
+You should:
+- Be polite and clear.
+- Avoid pretending to have access to private data or documents.
+- If the user asks about specific internal docs or knowledge bases, gently explain
+  that you can only answer general questions in chitchat mode.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+
+def get_answer_llm() -> ChatOpenAI:
+    global _answer_llm
+    if settings.OPENAI_API_KEY is None:
+        raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
+
+    api_key = settings.OPENAI_API_KEY.get_secret_value()
+    if _answer_llm is None:
+        logger.info("Initializing ChatOpenAI LLM for RAG answers.")
+        _answer_llm = ChatOpenAI(
+            model=settings.CHAT_MODEL_NAME,
+            temperature=settings.DEFAULT_TEMPERATURE,
+            api_key=api_key,
+            base_url=settings.OPENAI_API_BASE or None,
+        )
+    return _answer_llm
+
+
+def get_rewrite_llm() -> ChatOpenAI:
+    global _rewrite_llm
+    if settings.OPENAI_API_KEY is None:
+        raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
+
+    api_key = settings.OPENAI_API_KEY.get_secret_value()
+    if _rewrite_llm is None:
+        logger.info("Initializing ChatOpenAI LLM for question rewriting.")
+        _rewrite_llm = ChatOpenAI(
+            model=settings.CHAT_MODEL_NAME,
+            temperature=0.0,  # deterministic rewrites
+            api_key=api_key,
+            base_url=settings.OPENAI_API_BASE or None,
+        )
+    return _rewrite_llm
+
+
+def get_self_check_llm() -> ChatOpenAI:
+    global _self_check_llm
+    if _self_check_llm is None:
+        if settings.OPENAI_API_KEY is None:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. Please define it in your .env file."
+            )
+
+        # Unwrap SecretStr -> str
+        api_key = settings.OPENAI_API_KEY.get_secret_value()
+        logger.info("Initializing ChatOpenAI LLM for self-check.")
+        _self_check_llm = ChatOpenAI(
+            model=settings.CHAT_MODEL_NAME,
+            temperature=settings.DEFAULT_TEMPERATURE,
+            api_key=api_key,
+            base_url=settings.OPENAI_API_BASE or None,
+        )
+    return _self_check_llm
+
+
+def get_chitchat_llm() -> ChatOpenAI:
+    global _chitchat_llm
+    if _chitchat_llm is None:
+        if settings.OPENAI_API_KEY is None:
+            raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
+
+        # Unwrap SecretStr -> str
+        api_key = settings.OPENAI_API_KEY.get_secret_value()
+
+        logger.info("Initializing ChatOpenAI LLM for chitchat.")
+        _chitchat_llm = ChatOpenAI(
+            model=settings.CHAT_MODEL_NAME,
+            temperature=0.7,  # a bit more open-ended
+            api_key=api_key,
+            base_url=settings.OPENAI_API_BASE or None,
+        )
+    return _chitchat_llm
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_history_for_rewrite(history: List[Message]) -> str:
+    """
+    Turn chat history into a simple text transcript for question rewriting.
+    """
+    lines: List[str] = []
+    for msg in history:
+        prefix = "User" if msg.role == "user" else "Assistant"
+        lines.append(f"{prefix}: {msg.content}")
+    return "\n".join(lines)
+
+
+def _format_history_for_chitchat(history: List[Message]) -> str:
+    """
+    Turn chat history into a transcript for chitchat.
+    """
+    return _format_history_for_rewrite(history)
+
+
+async def _rewrite_question_if_needed(
+    history: List[Message],
+    question: str,
+) -> str:
+    """
+    If there is history, use LLM to rewrite the latest question as standalone.
+    Otherwise, return the original question.
+    """
+    if not history:
+        return question
+
+    llm = get_rewrite_llm()
+    chat_history_text = _format_history_for_rewrite(history)
+
+    prompt = CONDENSE_QUESTION_PROMPT.format(
+        chat_history=chat_history_text,
+        question=question,
+    )
+
+    logger.info("Rewriting question based on chat history.")
+    try:
+        response = await llm.ainvoke(prompt)  # type: ignore[arg-type]
+        standalone = getattr(response, "content", "") if response is not None else ""
+        standalone = standalone.strip() or question
+        logger.debug("Standalone question: %r", standalone)
+        return standalone
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error while rewriting question: %s", exc)
+        # Fallback to the original question
+        return question
+
+
+async def _generate_answer_from_context(
+    standalone_question: str,
+    context_text: str,
+    tone: str,
+    style: str,
+) -> str:
+    """
+    Generate an answer using the RAG ANSWER_PROMPT and context.
+    """
+    llm = get_answer_llm()
+
+    prompt = ANSWER_PROMPT.format(
+        context=context_text or "No relevant context found.",
+        question=standalone_question,
+        tone=tone,
+        style=style,
+    )
+
+    logger.info("Generating RAG answer.")
+    response = await llm.ainvoke(prompt)  # type: ignore[arg-type]
+    answer = getattr(response, "content", "") if response is not None else ""
+    return answer.strip()
+
+
+async def _self_check_answer(
+    question: str,
+    context_text: str,
+    draft_answer: str,
+) -> str:
+    """
+    Optionally refine an answer using a self-check prompt.
+
+    If anything fails, returns the original draft.
+    """
+    if not context_text:
+        # No context -> nothing to refine against
+        return draft_answer
+
+    llm = get_self_check_llm()
+    prompt = SELF_CHECK_PROMPT.format(
+        question=question,
+        context=context_text,
+        draft_answer=draft_answer,
+    )
+
+    logger.info("Running self-check on draft answer.")
+    try:
+        response = await llm.ainvoke(prompt)  # type: ignore[arg-type]
+        refined = getattr(response, "content", "") if response is not None else ""
+        refined = refined.strip()
+        return refined or draft_answer
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error during self-check: %s", exc)
+        return draft_answer
+
+
+def _build_sources_from_docs(docs) -> List[Source]:
+    """
+    Convert retrieved Documents to API Source objects.
+    """
+    sources: List[Source] = []
+    for idx, doc in enumerate(docs, start=1):
+        meta = doc.metadata or {}
+        source_id = str(meta.get("id") or meta.get("source") or f"chunk-{idx}")
+        title = meta.get("title") or meta.get("filename")
+        snippet = doc.page_content[:300].strip()  # simple snippet
+        sources.append(
+            Source(
+                id=source_id,
+                title=title,
+                snippet=snippet,
+                metadata=meta,
+            )
+        )
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# Public pipelines
+# ---------------------------------------------------------------------------
+
+
+async def run_rag_pipeline(
+    question: str,
+    history: List[Message],
+    tone: str,
+    style: str,
+    top_k: int,
+    namespace: Optional[str] = None,
+    use_self_check: bool = False,
+) -> ChatResponse:
+    """
+    Full RAG pipeline:
+
+    1. Optionally rewrite question based on history.
+    2. Retrieve relevant documents from vector store.
+    3. Build context and generate answer using ANSWER_PROMPT.
+    4. Optionally run self-check to refine answer.
+    5. Generate suggested follow-up questions.
+    """
+    logger.info(
+        "Running RAG pipeline (top_k=%d, namespace=%r).",
+        top_k,
+        namespace,
+    )
+
+    # 1) Question rewriting
+    standalone_question = await _rewrite_question_if_needed(history, question)
+
+    # 2) Retrieval
+    docs = await retrieve_docs(
+        query=standalone_question,
+        top_k=top_k,
+        namespace=namespace,
+    )
+
+    # 3) Build context and answer
+    context_text = docs_to_context(docs)
+    draft_answer = await _generate_answer_from_context(
+        standalone_question=standalone_question,
+        context_text=context_text,
+        tone=tone,
+        style=style,
+    )
+
+    # 4) Optional self-check
+    if use_self_check:
+        answer = await _self_check_answer(
+            question=standalone_question,
+            context_text=context_text,
+            draft_answer=draft_answer,
+        )
+    else:
+        answer = draft_answer
+
+    # 5) Suggested next questions
+    suggestions = await generate_suggested_questions(
+        question=question,
+        answer=answer,
+        context=context_text,
+    )
+
+    sources = _build_sources_from_docs(docs)
+
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        suggested_questions=suggestions,
+        intent="RAG_QA",
+    )
+
+
+async def run_chitchat_pipeline(
+    question: str,
+    history: List[Message],
+    tone: str,
+    style: str,
+) -> ChatResponse:
+    """
+    Chitchat pipeline (no retrieval).
+
+    Uses CHITCHAT_SYSTEM_PROMPT and the conversation history to generate a reply.
+    """
+    llm = get_chitchat_llm()
+
+    history_text = _format_history_for_chitchat(history)
+
+    full_prompt = f"""{CHITCHAT_SYSTEM_PROMPT}
+
+Conversation so far:
+{history_text}
+
+User message:
+{question}
+
+Assistant reply (tone={tone}, style={style}):
+"""
+
+    logger.info("Running chitchat pipeline.")
+    response = await llm.ainvoke(full_prompt)  # type: ignore[arg-type]
+    answer = getattr(response, "content", "") if response is not None else ""
+    answer = answer.strip()
+
+    # In chitchat mode, we don't have sources, but we still keep suggestions empty for clarity.
+    return ChatResponse(
+        answer=answer,
+        sources=[],
+        suggested_questions=[],
+        intent="CHITCHAT",
+    )

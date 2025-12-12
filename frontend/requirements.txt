@@ -1,0 +1,8 @@
+# --- Streamlit app ---
+streamlit>=1.35.0,<2.0.0
+
+# --- HTTP client to call backend ---
+requests>=2.32.0,<3.0.0
+
+# --- Optional: env loading for frontend config ---
+python-dotenv>=1.0.1,<2.0.0

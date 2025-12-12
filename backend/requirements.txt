@@ -1,0 +1,36 @@
+# --- Web framework ---
+fastapi>=0.111.0,<1.0.0
+uvicorn[standard]>=0.30.0,<0.31.0
+
+# --- Config & validation ---
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.2.1,<3.0.0
+python-dotenv>=1.0.1,<2.0.0
+
+# --- LangChain + LLMs ---
+langchain>=0.2.0,<0.3.0
+langchain-openai>=0.1.0,<0.2.0
+openai>=1.30.0,<2.0.0
+tiktoken>=0.7.0,<0.8.0
+
+# --- Postgres + pgvector as vector store ---
+sqlalchemy>=2.0.0,<3.0.0
+psycopg[binary]>=3.1.0,<4.0.0
+pgvector>=0.3.0,<0.4.0
+# optional, but very handy LangChain integration for PGVector
+langchain-postgres>=0.0.9,<0.1.0
+
+# --- HTTP / JSON utils ---
+httpx>=0.27.0,<0.28.0
+orjson>=3.10.0,<4.0.0
+
+# --- Misc ---
+typing-extensions>=4.11.0,<5.0.0
+
+# --- Dev only (optional) ---
+pytest>=8.2.0,<9.0.0
+pytest-asyncio>=0.23.0,<0.24.0
+ruff>=0.4.0,<0.5.0
+black>=24.4.0,<25.0.0
+
+python-multipart

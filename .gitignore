@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.log
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Project-specific ---
+# Local env files
+.env
+
+# Local data (vector db snapshots, uploads, etc.)
+data/
+tmp/
+logs/
+
+# Bytecode caches inside backend/frontend
+backend/**/__pycache__/
+frontend/**/__pycache__/
+
+# pytest cache
+.pytest_cache/
+
+# mypy / type-checking
+.mypy_cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+
+# Build / dist
+dist/
+build/
+*.egg-info/

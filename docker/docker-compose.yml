@@ -32,6 +32,15 @@ services:
       # Ensure backend points to the db service
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/rag_chatbot
 
+      # (Recommended) uploads/temp dir inside container used by file_store.py
+      UPLOAD_TMP_DIR: /app/.uploads
+
+      # (Optional) limit upload size; your save_upload_file enforces this
+      MAX_UPLOAD_MB: 25
+    volumes:
+      # Persist uploads dir (recommended)
+      - rag_chatbot_uploads:/app/.uploads
+
   frontend:
     build:
       context: ..
@@ -48,3 +57,4 @@ services:
 
 volumes:
   rag_chatbot_pgdata:
+  rag_chatbot_uploads:

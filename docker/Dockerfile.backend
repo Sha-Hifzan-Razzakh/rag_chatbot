@@ -5,10 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps (you may need build-essential/libpq-dev for psycopg)
+# System deps:
+# - build-essential/libpq-dev: for psycopg/pgvector builds (if needed)
+# - poppler-utils: required by pdf2image to render PDF pages
+# - tesseract-ocr: OCR engine for pytesseract
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
+    poppler-utils \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy backend requirements

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -12,15 +13,29 @@ from app.rag.embeddings import get_vector_store
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------
+# Tool-friendly result schema
+# -----------------------------
+
+class SearchDocResult(TypedDict, total=False):
+    id: str
+    title: Optional[str]
+    snippet: Optional[str]
+    metadata: Dict[str, Any]
+    score: Optional[float]
+
+
+# -----------------------------
+# Chunking helpers
+# -----------------------------
+
 def _get_text_splitter() -> RecursiveCharacterTextSplitter:
     """
     Create a text splitter for chunking documents.
-
-    You can later move these parameters to config if needed.
     """
     return RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150,
+        chunk_size=int(getattr(settings, "DEFAULT_CHUNK_SIZE", 1000)),
+        chunk_overlap=int(getattr(settings, "DEFAULT_CHUNK_OVERLAP", 150)),
         separators=["\n\n", "\n", " ", ""],
     )
 
@@ -32,10 +47,6 @@ def chunk_text(
 ) -> List[Document]:
     """
     Split raw text into LangChain Document chunks with metadata attached.
-
-    :param text: Raw text to chunk.
-    :param base_metadata: Metadata to apply to each chunk (e.g., filename, source).
-    :param namespace: Optional namespace / knowledge base identifier.
     """
     if base_metadata is None:
         base_metadata = {}
@@ -65,16 +76,16 @@ def chunk_text(
     return docs
 
 
+# -----------------------------
+# Vector store writing
+# -----------------------------
+
 async def add_documents(
     docs: List[Document],
     namespace: Optional[str] = None,
 ) -> int:
     """
     Add a list of Document objects to the PGVector store.
-
-    :param docs: List of LangChain Document objects.
-    :param namespace: Optional namespace (stored as metadata on each doc).
-    :return: Number of chunks actually added.
     """
     if not docs:
         logger.warning("add_documents called with empty docs list.")
@@ -83,7 +94,7 @@ async def add_documents(
     # Ensure namespace metadata is present on each document
     if namespace is not None:
         for doc in docs:
-            doc.metadata = {**doc.metadata, "namespace": namespace}
+            doc.metadata = {**(doc.metadata or {}), "namespace": namespace}
 
     vector_store = get_vector_store()
 
@@ -94,11 +105,13 @@ async def add_documents(
         namespace,
     )
 
-    # PGVector from langchain-postgres uses .add_documents
     vector_store.add_documents(docs)
-
     return len(docs)
 
+
+# -----------------------------
+# Legacy retrieval (kept)
+# -----------------------------
 
 async def retrieve_docs(
     query: str,
@@ -107,14 +120,10 @@ async def retrieve_docs(
 ) -> List[Document]:
     """
     Retrieve the most relevant documents from the vector store for a query.
-
-    :param query: User question (ideally standalone).
-    :param top_k: Number of documents to retrieve.
-    :param namespace: Optional namespace filter.
+    (Legacy pipeline helper.)
     """
     vector_store = get_vector_store()
 
-    # Build search filter
     search_filter: Dict[str, Any] = {}
     if namespace is not None:
         search_filter["namespace"] = namespace
@@ -126,7 +135,6 @@ async def retrieve_docs(
         namespace,
     )
 
-    # similarity_search supports a 'filter' argument in most LC vector stores
     docs: List[Document] = vector_store.similarity_search(
         query=query,
         k=top_k,
@@ -140,8 +148,7 @@ async def retrieve_docs(
 def docs_to_context(docs: List[Document]) -> str:
     """
     Convert a list of Documents into a single context string.
-
-    This is what we send into the ANSWER_PROMPT / LLM.
+    (Legacy pipeline helper.)
     """
     if not docs:
         return ""
@@ -149,12 +156,103 @@ def docs_to_context(docs: List[Document]) -> str:
     parts: List[str] = []
     for idx, doc in enumerate(docs, start=1):
         meta_str = ", ".join(
-            f"{k}={v}" for k, v in doc.metadata.items() if v is not None
+            f"{k}={v}" for k, v in (doc.metadata or {}).items() if v is not None
         )
         header = f"[Source {idx}] {meta_str}".strip()
         if header:
             parts.append(header)
         parts.append(doc.page_content)
-        parts.append("")  # blank line between docs
+        parts.append("")
 
     return "\n".join(parts)
+
+
+# -----------------------------
+# NEW: Tool-friendly search API
+# -----------------------------
+
+async def search_docs(
+    query: str,
+    top_k: Optional[int] = None,
+    namespace: Optional[str] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    truncate_chars: int = 500,
+) -> Dict[str, Any]:
+    """
+    Tool-friendly retrieval that returns stable JSON.
+
+    Returns:
+      {
+        "query": "...",
+        "top_k": int,
+        "namespace": str|None,
+        "results": [ {id,title,snippet,metadata,score}, ... ]
+      }
+    """
+    vector_store = get_vector_store()
+
+    k = int(top_k or settings.DEFAULT_TOP_K)
+    if k > settings.MAX_TOP_K:
+        k = int(settings.MAX_TOP_K)
+
+    search_filter: Dict[str, Any] = {}
+    if namespace is not None:
+        search_filter["namespace"] = namespace
+    if filters:
+        # merge without clobbering namespace unless explicitly provided
+        search_filter.update({k: v for k, v in filters.items() if v is not None})
+
+    logger.info(
+        "search_docs: query=%r (k=%d, namespace=%r, filters_keys=%s)",
+        query,
+        k,
+        namespace,
+        list((filters or {}).keys()),
+    )
+
+    # Prefer similarity_search_with_score if available (gives scores)
+    results: List[SearchDocResult] = []
+
+    if hasattr(vector_store, "similarity_search_with_score"):
+        pairs = vector_store.similarity_search_with_score(
+            query=query,
+            k=k,
+            filter=search_filter or None,
+        )
+        for doc, score in pairs:
+            results.append(_doc_to_result(doc, score=score, truncate_chars=truncate_chars))
+    else:
+        docs: List[Document] = vector_store.similarity_search(
+            query=query,
+            k=k,
+            filter=search_filter or None,
+        )
+        for doc in docs:
+            results.append(_doc_to_result(doc, score=None, truncate_chars=truncate_chars))
+
+    return {
+        "query": query,
+        "top_k": k,
+        "namespace": namespace,
+        "results": results,
+    }
+
+
+def _doc_to_result(doc: Document, *, score: Optional[float], truncate_chars: int) -> SearchDocResult:
+    md = dict(doc.metadata or {})
+
+    # best-effort id: prefer chunk_id/doc_id fields if present
+    _id = md.get("chunk_id") or md.get("id") or md.get("document_id") or md.get("source_id") or str(uuid.uuid4())
+    title = md.get("title") or md.get("filename") or md.get("file_name")
+
+    text = doc.page_content or ""
+    snippet = text if len(text) <= truncate_chars else (text[: max(0, truncate_chars - 1)] + "…")
+
+    out: SearchDocResult = {
+        "id": str(_id),
+        "title": str(title) if title is not None else None,
+        "snippet": snippet,
+        "metadata": md,
+        "score": float(score) if isinstance(score, (int, float)) else None,
+    }
+    return out

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_openai import ChatOpenAI
 
@@ -44,12 +45,15 @@ You should:
 # ---------------------------------------------------------------------------
 
 
-def get_answer_llm() -> ChatOpenAI:
-    global _answer_llm
+def _require_api_key() -> str:
     if settings.OPENAI_API_KEY is None:
         raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
+    return settings.OPENAI_API_KEY.get_secret_value()
 
-    api_key = settings.OPENAI_API_KEY.get_secret_value()
+
+def get_answer_llm() -> ChatOpenAI:
+    global _answer_llm
+    api_key = _require_api_key()
     if _answer_llm is None:
         logger.info("Initializing ChatOpenAI LLM for RAG answers.")
         _answer_llm = ChatOpenAI(
@@ -63,10 +67,7 @@ def get_answer_llm() -> ChatOpenAI:
 
 def get_rewrite_llm() -> ChatOpenAI:
     global _rewrite_llm
-    if settings.OPENAI_API_KEY is None:
-        raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
-
-    api_key = settings.OPENAI_API_KEY.get_secret_value()
+    api_key = _require_api_key()
     if _rewrite_llm is None:
         logger.info("Initializing ChatOpenAI LLM for question rewriting.")
         _rewrite_llm = ChatOpenAI(
@@ -80,14 +81,8 @@ def get_rewrite_llm() -> ChatOpenAI:
 
 def get_self_check_llm() -> ChatOpenAI:
     global _self_check_llm
+    api_key = _require_api_key()
     if _self_check_llm is None:
-        if settings.OPENAI_API_KEY is None:
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. Please define it in your .env file."
-            )
-
-        # Unwrap SecretStr -> str
-        api_key = settings.OPENAI_API_KEY.get_secret_value()
         logger.info("Initializing ChatOpenAI LLM for self-check.")
         _self_check_llm = ChatOpenAI(
             model=settings.CHAT_MODEL_NAME,
@@ -100,17 +95,12 @@ def get_self_check_llm() -> ChatOpenAI:
 
 def get_chitchat_llm() -> ChatOpenAI:
     global _chitchat_llm
+    api_key = _require_api_key()
     if _chitchat_llm is None:
-        if settings.OPENAI_API_KEY is None:
-            raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file.")
-
-        # Unwrap SecretStr -> str
-        api_key = settings.OPENAI_API_KEY.get_secret_value()
-
         logger.info("Initializing ChatOpenAI LLM for chitchat.")
         _chitchat_llm = ChatOpenAI(
             model=settings.CHAT_MODEL_NAME,
-            temperature=0.7,  # a bit more open-ended
+            temperature=0.7,  # more open-ended
             api_key=api_key,
             base_url=settings.OPENAI_API_BASE or None,
         )
@@ -145,8 +135,7 @@ async def _rewrite_question_if_needed(
     question: str,
 ) -> str:
     """
-    If there is history, use LLM to rewrite the latest question as standalone.
-    Otherwise, return the original question.
+    If there is history, rewrite latest question into a standalone question.
     """
     if not history:
         return question
@@ -168,7 +157,6 @@ async def _rewrite_question_if_needed(
         return standalone
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error while rewriting question: %s", exc)
-        # Fallback to the original question
         return question
 
 
@@ -203,11 +191,8 @@ async def _self_check_answer(
 ) -> str:
     """
     Optionally refine an answer using a self-check prompt.
-
-    If anything fails, returns the original draft.
     """
     if not context_text:
-        # No context -> nothing to refine against
         return draft_answer
 
     llm = get_self_check_llm()
@@ -235,9 +220,9 @@ def _build_sources_from_docs(docs) -> List[Source]:
     sources: List[Source] = []
     for idx, doc in enumerate(docs, start=1):
         meta = doc.metadata or {}
-        source_id = str(meta.get("id") or meta.get("source") or f"chunk-{idx}")
+        source_id = str(meta.get("id") or meta.get("chunk_id") or meta.get("source") or f"chunk-{idx}")
         title = meta.get("title") or meta.get("filename")
-        snippet = doc.page_content[:300].strip()  # simple snippet
+        snippet = (doc.page_content or "")[:300].strip()
         sources.append(
             Source(
                 id=source_id,
@@ -262,33 +247,28 @@ async def run_rag_pipeline(
     top_k: int,
     namespace: Optional[str] = None,
     use_self_check: bool = False,
+    conversation_id: Optional[str] = None,
 ) -> ChatResponse:
     """
     Full RAG pipeline:
-
-    1. Optionally rewrite question based on history.
-    2. Retrieve relevant documents from vector store.
-    3. Build context and generate answer using ANSWER_PROMPT.
-    4. Optionally run self-check to refine answer.
-    5. Generate suggested follow-up questions.
+    1) rewrite question (optional)
+    2) retrieve docs
+    3) answer from context
+    4) optional self-check
+    5) suggested next questions
     """
-    logger.info(
-        "Running RAG pipeline (top_k=%d, namespace=%r).",
-        top_k,
-        namespace,
-    )
+    convo_id = conversation_id or str(uuid.uuid4())
 
-    # 1) Question rewriting
+    logger.info("Running RAG pipeline (top_k=%d, namespace=%r).", top_k, namespace)
+
     standalone_question = await _rewrite_question_if_needed(history, question)
 
-    # 2) Retrieval
     docs = await retrieve_docs(
         query=standalone_question,
         top_k=top_k,
         namespace=namespace,
     )
 
-    # 3) Build context and answer
     context_text = docs_to_context(docs)
     draft_answer = await _generate_answer_from_context(
         standalone_question=standalone_question,
@@ -297,7 +277,6 @@ async def run_rag_pipeline(
         style=style,
     )
 
-    # 4) Optional self-check
     if use_self_check:
         answer = await _self_check_answer(
             question=standalone_question,
@@ -307,7 +286,6 @@ async def run_rag_pipeline(
     else:
         answer = draft_answer
 
-    # 5) Suggested next questions
     suggestions = await generate_suggested_questions(
         question=question,
         answer=answer,
@@ -317,10 +295,13 @@ async def run_rag_pipeline(
     sources = _build_sources_from_docs(docs)
 
     return ChatResponse(
+        conversation_id=convo_id,
+        trace=None,
         answer=answer,
         sources=sources,
         suggested_questions=suggestions,
         intent="RAG_QA",
+        answer_audio_b64=None,
     )
 
 
@@ -329,14 +310,14 @@ async def run_chitchat_pipeline(
     history: List[Message],
     tone: str,
     style: str,
+    conversation_id: Optional[str] = None,
 ) -> ChatResponse:
     """
     Chitchat pipeline (no retrieval).
-
-    Uses CHITCHAT_SYSTEM_PROMPT and the conversation history to generate a reply.
     """
-    llm = get_chitchat_llm()
+    convo_id = conversation_id or str(uuid.uuid4())
 
+    llm = get_chitchat_llm()
     history_text = _format_history_for_chitchat(history)
 
     full_prompt = f"""{CHITCHAT_SYSTEM_PROMPT}
@@ -355,10 +336,83 @@ Assistant reply (tone={tone}, style={style}):
     answer = getattr(response, "content", "") if response is not None else ""
     answer = answer.strip()
 
-    # In chitchat mode, we don't have sources, but we still keep suggestions empty for clarity.
     return ChatResponse(
+        conversation_id=convo_id,
+        trace=None,
         answer=answer,
         sources=[],
         suggested_questions=[],
         intent="CHITCHAT",
+        answer_audio_b64=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: Tool-friendly entrypoint for rag_tools.py
+# ---------------------------------------------------------------------------
+
+async def answer_with_rag(
+    question: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    tone: Optional[str] = None,
+    style: Optional[str] = None,
+    top_k: Optional[int] = None,
+    namespace: Optional[str] = None,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Tool-friendly "retrieve + answer" endpoint.
+
+    Returns stable JSON:
+      {
+        "answer": str,
+        "sources": [ {id,title,snippet,metadata}, ... ],
+        "suggested_questions": [str, ...]
+      }
+
+    Notes:
+    - filters is accepted for future compatibility; legacy retrieve_docs doesn't use it.
+      If you add metadata filtering later, wire it through.
+    """
+    # Convert history dicts to Message models (best-effort)
+    msg_history: List[Message] = []
+    for m in (history or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role and content is not None:
+            msg_history.append(Message(role=role, content=str(content)))
+
+    k = int(top_k or settings.DEFAULT_TOP_K)
+    if k > settings.MAX_TOP_K:
+        k = int(settings.MAX_TOP_K)
+
+    resp = await run_rag_pipeline(
+        question=question,
+        history=msg_history,
+        tone=tone or "neutral",
+        style=style or "concise",
+        top_k=k,
+        namespace=namespace,
+        use_self_check=False,
+        conversation_id=str(uuid.uuid4()),
+    )
+
+    # Convert Source models to dict
+    sources = [
+        {
+            "id": s.id,
+            "title": s.title,
+            "snippet": s.snippet,
+            "metadata": s.metadata,
+        }
+        for s in resp.sources
+    ]
+
+    return {
+        "answer": resp.answer,
+        "sources": sources,
+        "suggested_questions": resp.suggested_questions,
+        "intent": resp.intent,
+    }

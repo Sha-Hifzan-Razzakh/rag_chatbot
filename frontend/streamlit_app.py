@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional
 import base64
 import requests
 import streamlit as st
-from components.sidebar import render_sidebar
 
 from dotenv import load_dotenv
 
@@ -16,6 +15,7 @@ load_dotenv()
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 CHAT_ENDPOINT = f"{BACKEND_URL}/v1/chat"
 INGEST_TEXT_ENDPOINT = f"{BACKEND_URL}/v1/ingest/text"
+INGEST_FILE_ENDPOINT = f"{BACKEND_URL}/v1/ingest/file"
 HEALTH_ENDPOINT = f"{BACKEND_URL}/v1/health"
 
 
@@ -86,6 +86,7 @@ except Exception:  # noqa: BLE001
         - namespace
         - ingest_text
         - ingest_button_clicked
+        - debug (NEW)
         """
         with st.sidebar:
             st.title("RAG Chatbot Settings")
@@ -120,6 +121,9 @@ except Exception:  # noqa: BLE001
                 placeholder="e.g. 'kb-1' or leave blank",
             )
 
+            st.markdown("#### Agent")
+            debug = st.toggle("Debug trace (agent)", value=st.session_state.get("debug", False))
+
             st.markdown("---")
             st.markdown("#### Ingest text")
             ingest_text = st.text_area(
@@ -132,6 +136,8 @@ except Exception:  # noqa: BLE001
             st.markdown("---")
             if st.button("Clear chat", key="clear_chat_button"):
                 st.session_state["messages"] = []
+                st.session_state["conversation_id"] = None
+                st.rerun()
 
         return {
             "tone": tone,
@@ -140,13 +146,22 @@ except Exception:  # noqa: BLE001
             "namespace": namespace or None,
             "ingest_text": ingest_text,
             "ingest_button_clicked": ingest_button_clicked,
+            "debug": debug,
         }
+
+
+# NEW: document uploader component (components/uploader.py)
+try:
+    from components.uploader import render_uploader  # type: ignore
+except Exception:  # noqa: BLE001
+    def render_uploader(*, backend_base_url: str, default_namespace: str = "", show_advanced: bool = True):
+        st.info("components/uploader.py not found yet. Create it to enable document upload ingestion.")
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Session state init
 # ---------------------------------------------------------------------------
-
 
 def init_session_state() -> None:
     if "messages" not in st.session_state:
@@ -154,11 +169,16 @@ def init_session_state() -> None:
     if "queued_question" not in st.session_state:
         st.session_state["queued_question"] = None
 
+    # NEW (agent support)
+    if "conversation_id" not in st.session_state:
+        st.session_state["conversation_id"] = None
+    if "debug" not in st.session_state:
+        st.session_state["debug"] = False
+
 
 # ---------------------------------------------------------------------------
 # Backend calls
 # ---------------------------------------------------------------------------
-
 
 def call_health() -> Optional[Dict[str, Any]]:
     try:
@@ -195,6 +215,8 @@ def call_chat(
     top_k: int,
     namespace: Optional[str],
     return_audio: bool = False,
+    conversation_id: Optional[str] = None,  # NEW
+    debug: bool = False,  # NEW
 ) -> Optional[Dict[str, Any]]:
     """
     Call the backend /v1/chat endpoint.
@@ -216,6 +238,10 @@ def call_chat(
         "top_k": top_k,
         "namespace": namespace,
         "return_audio": return_audio,
+
+        # NEW (agent support)
+        "conversation_id": conversation_id,
+        "debug": debug,
     }
 
     try:
@@ -228,6 +254,7 @@ def call_chat(
         st.error(f"Chat error: {exc}")
     return None
 
+
 def stt_transcribe(backend_url: str, audio_bytes: bytes, filename="audio.wav", language=None):
     files = {"file": (filename, audio_bytes, "audio/wav")}
     params = {"language": language} if language else {}
@@ -239,7 +266,6 @@ def stt_transcribe(backend_url: str, audio_bytes: bytes, filename="audio.wav", l
 # ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
-
 
 def main() -> None:
     st.set_page_config(
@@ -273,20 +299,31 @@ def main() -> None:
     style = sidebar_state["style"]
     top_k = sidebar_state["top_k"]
     namespace = sidebar_state["namespace"]
+
+    # NEW: agent debug flag
+    st.session_state["debug"] = bool(sidebar_state.get("debug", st.session_state.get("debug", False)))
+
     sidebar_state.setdefault("tts_enabled", sidebar_state.get("use_tts", False))
     tts_enabled = bool(sidebar_state["tts_enabled"])
     tts_mode = sidebar_state.get("tts_mode", "inline_base64")
 
     return_audio = bool(tts_enabled and tts_mode == "inline_base64")
 
+    # ---------------------------
+    # STT (unchanged)
+    # ---------------------------
     st.subheader("Speech to Text")
-    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "webm"])
+    audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "webm"], key="stt_audio")
 
-    if st.button("Transcribe") and audio_file is not None:
+    if st.button("Transcribe", key="stt_transcribe") and audio_file is not None:
         text = stt_transcribe(BACKEND_URL, audio_file.read(), filename=audio_file.name)
         st.write(text)
 
+    st.markdown("---")
 
+    # ---------------------------
+    # Existing: text ingestion
+    # ---------------------------
     if sidebar_state["ingest_button_clicked"] and sidebar_state["ingest_text"].strip():
         with st.spinner("Ingesting text into vector store..."):
             ingest_result = call_ingest_text(
@@ -310,14 +347,12 @@ def main() -> None:
     # Chat input
     user_input = st.chat_input("Ask a question about your documents or just chat...")
 
-    # Suggested question clicked?
     question_to_send: Optional[str] = None
     if user_input:
         question_to_send = user_input
     elif queued_question:
         question_to_send = queued_question
 
-    # If we have a question to send, do the round-trip
     if question_to_send:
         # Append user message
         st.session_state["messages"].append(
@@ -340,27 +375,38 @@ def main() -> None:
                     top_k=top_k,
                     namespace=namespace,
                     return_audio=return_audio,
+
+                    # NEW
+                    conversation_id=st.session_state.get("conversation_id"),
+                    debug=st.session_state.get("debug", False),
                 )
 
             if response is None:
                 st.error("No response from backend.")
                 return
 
+            # NEW: persist conversation id returned by backend
+            st.session_state["conversation_id"] = response.get("conversation_id") or st.session_state.get("conversation_id")
+
             answer = response.get("answer", "")
             sources = response.get("sources", [])
             suggested = response.get("suggested_questions", [])
             intent = response.get("intent", "RAG_QA")
+            trace = response.get("trace")  # NEW
 
-            # Show answer in the live assistant bubble
             st.markdown(answer)
 
-            #  PLACE: capture/store base64 (inline mode only)
+            # NEW: show trace (debug mode)
+            if st.session_state.get("debug") and trace:
+                with st.expander("Agent trace", expanded=False):
+                    st.json(trace)
+
+            # FIX: store base64 audio string, not the whole response dict
             answer_audio_b64 = None
             if tts_enabled and tts_mode == "inline_base64":
-                answer_audio_b64 = response  # Store the base64 audio data
+                answer_audio_b64 = response.get("answer_audio_b64")
 
-            # PLACE: playback (both modes)
-
+            # TTS playback (unchanged behavior)
             if tts_enabled:
                 if tts_mode == "inline_base64":
                     audio_b64 = response.get("answer_audio_b64")
@@ -379,7 +425,6 @@ def main() -> None:
                     else:
                         st.warning(f"TTS failed: {tts_resp.status_code} - {tts_resp.text}")
 
-
             if sources:
                 with st.expander("Sources", expanded=False):
                     for idx, src in enumerate(sources, start=1):
@@ -393,7 +438,7 @@ def main() -> None:
                             with st.expander("Metadata", expanded=False):
                                 st.json(meta)
 
-            # Suggested questions as buttons (click queues them for the next run)
+            # Suggested questions as buttons
             if suggested:
                 st.markdown("**Suggested questions:**")
                 for i, q in enumerate(suggested):
@@ -401,7 +446,7 @@ def main() -> None:
                         st.session_state["queued_question"] = q
                         st.rerun()
 
-            # Append to history for future render
+            # Append to history
             st.session_state["messages"].append(
                 {
                     "role": "assistant",
@@ -410,6 +455,8 @@ def main() -> None:
                     "sources": sources,
                     "suggested_questions": suggested,
                     "answer_audio_b64": answer_audio_b64,
+                    # (optional) keep trace per message if you want
+                    "trace": trace if st.session_state.get("debug") else None,
                 }
             )
 
